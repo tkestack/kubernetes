@@ -53,6 +53,8 @@ const (
 	libcontainerSystemd libcontainerCgroupManagerType = "systemd"
 	// systemdSuffix is the cgroup name suffix for systemd
 	systemdSuffix string = ".slice"
+	// MemoryMin is memory.min for cgroup v2
+	MemoryMin string = "memory.min"
 )
 
 var RootCgroupName = CgroupName([]string{})
@@ -434,6 +436,13 @@ func (m *cgroupManagerImpl) toResources(resourceConfig *ResourceConfig) *libcont
 			Limit:    uint64(0),
 		})
 	}
+	// only for cgroup v2
+	if resourceConfig.Unified != nil {
+		resources.Unified = make(map[string]string)
+		for k, v := range resourceConfig.Unified {
+			resources.Unified[k] = v
+		}
+	}
 	return resources
 }
 
@@ -542,7 +551,7 @@ func (m *cgroupManagerImpl) Pids(name CgroupName) []int {
 	// we need the driver specific name
 	cgroupFsName := m.Name(name)
 
-	// Get a list of processes that we need to kill
+	// Get a list of processes that we need to kil
 	pidsToKill := sets.NewInt()
 	var pids []int
 	for _, val := range m.subsystems.MountPoints {
