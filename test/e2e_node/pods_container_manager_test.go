@@ -18,12 +18,14 @@ package e2enode
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -137,6 +139,91 @@ func makePodToVerifyCgroupRemoved(baseName string) *v1.Pod {
 		},
 		Spec: v1.PodSpec{
 			RestartPolicy: v1.RestartPolicyOnFailure,
+			Containers: []v1.Container{
+				{
+					Image:   busyboxImage,
+					Name:    "container" + string(uuid.NewUUID()),
+					Command: []string{"sh", "-c", command},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      "sysfscgroup",
+							MountPath: "/tmp",
+						},
+					},
+				},
+			},
+			Volumes: []v1.Volume{
+				{
+					Name: "sysfscgroup",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{Path: "/sys/fs/cgroup"},
+					},
+				},
+			},
+		},
+	}
+	return pod
+}
+
+// makePodToVerifyCgroupsV2 returns a pod that verifies the existence of the specified cgroups.
+// keys of interfaceFiles, operators, expects are the cgroupName in cgroupNames slice.
+func makePodToVerifyCgroupsV2(cgroupNames []string, interfaceFilesMap, operatorsMap, expectsMap map[string][]string) *v1.Pod {
+	if !(len(cgroupNames) == len(interfaceFilesMap) && len(interfaceFilesMap) == len(operatorsMap) &&
+		len(operatorsMap) == len(expectsMap)) {
+		return nil
+	}
+	// convert the names to their literal cgroupfs forms...
+	cgroupFsNames := []string{}
+	rootCgroupName := cm.NewCgroupName(cm.RootCgroupName, defaultNodeAllocatableCgroup)
+	for _, baseName := range cgroupNames {
+		// Add top level cgroup used to enforce node allocatable.
+		cgroupComponents := strings.Split(baseName, "/")
+		cgroupName := cm.NewCgroupName(rootCgroupName, cgroupComponents...)
+		cgroupFsNames = append(cgroupFsNames, toCgroupFsName(cgroupName))
+	}
+	klog.Infof("expecting %v cgroups to be found", cgroupFsNames)
+	// build the pod command to either verify cgroups exist
+	command := ""
+	for i, cgroupFsName := range cgroupFsNames {
+		localCommand := "if [ ! -d /tmp/" + cgroupFsName + " ]; then exit 1; fi; "
+
+		cgroupName := cgroupNames[i]
+		interfaceFiles := interfaceFilesMap[cgroupName]
+		operators := operatorsMap[cgroupName]
+		expects := expectsMap[cgroupName]
+
+		if !(len(interfaceFiles) == len(operators) && len(operators) == len(expects)) {
+			continue
+		}
+
+		for k := range interfaceFiles {
+			interfaceFile := interfaceFiles[k]
+			operator := operators[k]
+			expect := expects[k]
+
+			switch operator {
+			case "=", "!=", ">", "<":
+				localCommand += "if ! [ $(cat /tmp/" + cgroupFsName + "/" + interfaceFile + ") " + operator + " " + expect + " ]; then exit 1; fi; "
+			case ">=":
+				localCommand += "if [ $(cat /tmp/" + cgroupFsName + "/" + interfaceFile + ") < " + expect + " ]; then exit 1; fi; "
+			case "<=":
+				localCommand += "if [ $(cat /tmp/" + cgroupFsName + "/" + interfaceFile + ") > " + expect + " ]; then exit 1; fi; "
+			default:
+				continue
+			}
+		}
+
+		klog.Infof("command to verify cgroup v2 settings for %s: %s", cgroupFsName, localCommand)
+
+		command += localCommand
+	}
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod" + string(uuid.NewUUID()),
+		},
+		Spec: v1.PodSpec{
+			RestartPolicy: v1.RestartPolicyNever,
 			Containers: []v1.Container{
 				{
 					Image:   busyboxImage,
@@ -310,6 +397,140 @@ var _ = SIGDescribe("Kubelet Cgroup Manager", func() {
 					err := f.PodClient().Delete(context.TODO(), burstablePod.Name, metav1.DeleteOptions{GracePeriodSeconds: &gp})
 					framework.ExpectNoError(err)
 					pod := makePodToVerifyCgroupRemoved("burstable/pod" + podUID)
+					f.PodClient().Create(pod)
+					err = e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+					framework.ExpectNoError(err)
+				})
+			})
+		})
+		ginkgo.Context("On scheduling a Burstable Pod with MemoryQoS and cgroup v2 enabled", func() {
+			ginkgo.It("Cgroup2 memory.min should have been set at the levels of Burstable QoS and pod", func() {
+				if !framework.TestContext.FeatureGates[string(features.MemoryQoS)] || !IsCgroup2UnifiedMode() {
+					return
+				}
+				var (
+					podUID       string
+					burstablePod *v1.Pod
+				)
+				ginkgo.By("Creating a Burstable pod in Namespace", func() {
+					burstablePod = f.PodClient().Create(&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "pod" + string(uuid.NewUUID()),
+							Namespace: f.Namespace.Name,
+						},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{
+									Image:     imageutils.GetPauseImageName(),
+									Name:      "container" + string(uuid.NewUUID()),
+									Resources: getResourceRequirements(getResourceList("100m", "100Mi"), getResourceList("200m", "200Mi")),
+								},
+							},
+						},
+					})
+					podUID = string(burstablePod.UID)
+				})
+				ginkgo.By("Checking if the pod cgroup was created", func() {
+					cgroupsToVerify := []string{"burstable/pod" + podUID}
+					pod := makePodToVerifyCgroups(cgroupsToVerify)
+					f.PodClient().Create(pod)
+					err := e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+					framework.ExpectNoError(err)
+				})
+				ginkgo.By("Checking if memory.min was set correctly at QoS and pod level", func() {
+					cgroupNames := []string{"burstable", "burstable/pod" + podUID}
+					interfaceFilesMap := map[string][]string{
+						cgroupNames[0]: {"memory.min"},
+						cgroupNames[1]: {"memory.min"},
+					}
+					operatorsMap := map[string][]string{
+						cgroupNames[0]: {">="},
+						cgroupNames[1]: {"="},
+					}
+					expectsMap := map[string][]string{
+						cgroupNames[0]: {strconv.FormatInt(100*1024*1024, 10)},
+						cgroupNames[1]: {strconv.FormatInt(100*1024*1024, 10)},
+					}
+					pod := makePodToVerifyCgroupsV2(cgroupNames, interfaceFilesMap, operatorsMap, expectsMap)
+					if pod == nil {
+						return
+					}
+					f.PodClient().Create(pod)
+					err := e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+					framework.ExpectNoError(err)
+				})
+				ginkgo.By("Checking if the pod cgroup was deleted", func() {
+					gp := int64(1)
+					err := f.PodClient().Delete(context.TODO(), burstablePod.Name, metav1.DeleteOptions{GracePeriodSeconds: &gp})
+					framework.ExpectNoError(err)
+					pod := makePodToVerifyCgroupRemoved("burstable/pod" + podUID)
+					f.PodClient().Create(pod)
+					err = e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+					framework.ExpectNoError(err)
+				})
+			})
+		})
+		ginkgo.Context("On scheduling a Guaranteed Pod with MemoryQoS and cgroup v2 enabled", func() {
+			ginkgo.It("Cgroup2 memory.min should have been set at the levels of Guaranteed QoS and pod", func() {
+				if !framework.TestContext.FeatureGates[string(features.MemoryQoS)] || !IsCgroup2UnifiedMode() {
+					return
+				}
+				var (
+					podUID        string
+					guaranteedPod *v1.Pod
+				)
+				ginkgo.By("Creating a Guaranteed pod in Namespace", func() {
+					guaranteedPod = f.PodClient().Create(&v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "pod" + string(uuid.NewUUID()),
+							Namespace: f.Namespace.Name,
+						},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{
+									Image:     imageutils.GetPauseImageName(),
+									Name:      "container" + string(uuid.NewUUID()),
+									Resources: getResourceRequirements(getResourceList("100m", "200Mi"), getResourceList("100m", "200Mi")),
+								},
+							},
+						},
+					})
+					podUID = string(guaranteedPod.UID)
+				})
+				ginkgo.By("Checking if the pod cgroup was created", func() {
+					cgroupsToVerify := []string{"pod" + podUID}
+					pod := makePodToVerifyCgroups(cgroupsToVerify)
+					f.PodClient().Create(pod)
+					err := e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+					framework.ExpectNoError(err)
+				})
+				ginkgo.By("Checking if memory.min was set correctly at QoS and pod level", func() {
+					cgroupNames := []string{"", "pod" + podUID}
+					interfaceFilesMap := map[string][]string{
+						cgroupNames[0]: {"memory.min"},
+						cgroupNames[1]: {"memory.min"},
+					}
+					operatorsMap := map[string][]string{
+						cgroupNames[0]: {">="},
+						cgroupNames[1]: {"="},
+					}
+					expectsMap := map[string][]string{
+						cgroupNames[0]: {strconv.FormatInt(200*1024*1024, 10)},
+						cgroupNames[1]: {strconv.FormatInt(200*1024*1024, 10)},
+					}
+					pod := makePodToVerifyCgroupsV2(cgroupNames, interfaceFilesMap, operatorsMap, expectsMap)
+					if pod == nil {
+						return
+					}
+					f.PodClient().Create(pod)
+					err := e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
+					framework.ExpectNoError(err)
+				})
+				ginkgo.By("Checking if the pod cgroup was deleted", func() {
+					gp := int64(1)
+					err := f.PodClient().Delete(context.TODO(), guaranteedPod.Name, metav1.DeleteOptions{GracePeriodSeconds: &gp})
+					framework.ExpectNoError(err)
+					pod := makePodToVerifyCgroupRemoved("guaranteed/pod" + podUID)
 					f.PodClient().Create(pod)
 					err = e2epod.WaitForPodSuccessInNamespace(f.ClientSet, pod.Name, f.Namespace.Name)
 					framework.ExpectNoError(err)
